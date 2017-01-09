@@ -49,6 +49,7 @@ func saveJsonConfig(config *Config, path string) error {
 		return err
 	}
 	defer file.Close()
-
-	return json.NewEncoder(file).Encode(config)
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("  ", "  ")
+	return encoder.Encode(config)
 }

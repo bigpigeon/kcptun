@@ -9,12 +9,15 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"runtime/pprof"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/pbkdf2"
 
 	"github.com/klauspost/compress/snappy"
 	"github.com/pkg/errors"
+	"github.com/urfave/cli"
 	kcp "github.com/xtaci/kcp-go"
 	"github.com/xtaci/smux"
 )
@@ -82,12 +85,159 @@ func handleClient(sess *smux.Session, p1 io.ReadWriteCloser) {
 
 func checkError(err error) {
 	if err != nil {
-		log.Printf("%+v\n", err)
+		panic(err)
 		os.Exit(-1)
 	}
 }
 
-func process(config Config) {
+func argeParse() *cli.App {
+	myApp := cli.NewApp()
+	myApp.Name = "kcptun"
+	myApp.Usage = "client(with SMUX)"
+	myApp.Version = VERSION
+	myApp.Flags = []cli.Flag{
+		cli.StringFlag{
+			Name:  "localaddr,l",
+			Value: ":12948",
+			Usage: "local listen address",
+		},
+		cli.StringFlag{
+			Name:  "remoteaddr, r",
+			Value: "vps:29900",
+			Usage: "kcp server address",
+		},
+		cli.StringFlag{
+			Name:   "key",
+			Value:  "it's a secrect",
+			Usage:  "pre-shared secret between client and server",
+			EnvVar: "KCPTUN_KEY",
+		},
+		cli.StringFlag{
+			Name:  "crypt",
+			Value: "aes",
+			Usage: "aes, aes-128, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, none",
+		},
+		cli.StringFlag{
+			Name:  "mode",
+			Value: "fast",
+			Usage: "profiles: fast3, fast2, fast, normal",
+		},
+		cli.IntFlag{
+			Name:  "conn",
+			Value: 1,
+			Usage: "set num of UDP connections to server",
+		},
+		cli.IntFlag{
+			Name:  "autoexpire",
+			Value: 0,
+			Usage: "set auto expiration time(in seconds) for a single UDP connection, 0 to disable",
+		},
+		cli.IntFlag{
+			Name:  "mtu",
+			Value: 1350,
+			Usage: "set maximum transmission unit for UDP packets",
+		},
+		cli.IntFlag{
+			Name:  "sndwnd",
+			Value: 128,
+			Usage: "set send window size(num of packets)",
+		},
+		cli.IntFlag{
+			Name:  "rcvwnd",
+			Value: 512,
+			Usage: "set receive window size(num of packets)",
+		},
+		cli.IntFlag{
+			Name:  "datashard",
+			Value: 10,
+			Usage: "set reed-solomon erasure coding - datashard",
+		},
+		cli.IntFlag{
+			Name:  "parityshard",
+			Value: 3,
+			Usage: "set reed-solomon erasure coding - parityshard",
+		},
+		cli.IntFlag{
+			Name:  "dscp",
+			Value: 0,
+			Usage: "set DSCP(6bit)",
+		},
+		cli.BoolFlag{
+			Name:  "nocomp",
+			Usage: "disable compression",
+		},
+		cli.BoolFlag{
+			Name:   "acknodelay",
+			Usage:  "flush ack immediately when a packet is received",
+			Hidden: true,
+		},
+		cli.IntFlag{
+			Name:   "nodelay",
+			Value:  0,
+			Hidden: true,
+		},
+		cli.IntFlag{
+			Name:   "interval",
+			Value:  40,
+			Hidden: true,
+		},
+		cli.IntFlag{
+			Name:   "resend",
+			Value:  0,
+			Hidden: true,
+		},
+		cli.IntFlag{
+			Name:   "nc",
+			Value:  0,
+			Hidden: true,
+		},
+		cli.IntFlag{
+			Name:   "sockbuf",
+			Value:  4194304, // socket buffer size in bytes
+			Hidden: true,
+		},
+		cli.IntFlag{
+			Name:   "keepalive",
+			Value:  10, // nat keepalive interval in seconds
+			Hidden: true,
+		},
+		cli.StringFlag{
+			Name:  "snmplog",
+			Value: "",
+			Usage: "collect snmp to file, aware of timeformat in golang, like: ./snmp-20060102.log",
+		},
+		cli.IntFlag{
+			Name:  "snmpperiod",
+			Value: 60,
+			Usage: "snmp collect period, in seconds",
+		},
+		cli.StringFlag{
+			Name:  "log",
+			Value: "",
+			Usage: "specify a log file to output, default goes to stderr",
+		},
+		cli.StringFlag{
+			Name:  "c",
+			Value: "config.json", // when the value is not empty, the config path must exists
+			Usage: "config from json file, which will override the command from shell",
+		},
+		cli.StringFlag{
+			Name:  "cpuprofile",
+			Value: "",
+			Usage: "write cpu profile to file",
+		},
+		cli.StringFlag{
+			Name:  "memprofile",
+			Value: "",
+			Usage: "write cpu profile to file",
+		},
+	}
+	return myApp
+}
+
+func background(config *Config, stop chan bool, wg *sync.WaitGroup) {
+	wg.Add(1)
+	defer wg.Done()
 	// log redirect
 	if config.Log != "" {
 		f, err := os.OpenFile(config.Log, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
@@ -111,6 +261,7 @@ func process(config Config) {
 	addr, err := net.ResolveTCPAddr("tcp", config.LocalAddr)
 	checkError(err)
 	listener, err := net.ListenTCP("tcp", addr)
+	defer listener.Close()
 	checkError(err)
 
 	pass := pbkdf2.Key([]byte(config.Key), []byte(SALT), 4096, 32, sha1.New)
@@ -162,7 +313,6 @@ func process(config Config) {
 
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.MaxReceiveBuffer = config.SockBuf
-
 	createConn := func() (*smux.Session, error) {
 		kcpconn, err := kcp.DialWithOptions(config.RemoteAddr, block, config.DataShard, config.ParityShard)
 		if err != nil {
@@ -223,32 +373,108 @@ func process(config Config) {
 	}
 
 	chScavenger := make(chan *smux.Session, 128)
-	go scavenger(chScavenger)
-	go snmpLogger(config.SnmpLog, config.SnmpPeriod)
+	quit := make(chan bool)
+	defer close(quit)
+
+	go func() {
+		wg.Add(1)
+		defer wg.Done()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		var sessionList []scavengeSession
+		for {
+			select {
+			case sess := <-chScavenger:
+				sessionList = append(sessionList, scavengeSession{sess, time.Now()})
+			case <-ticker.C:
+				var newList []scavengeSession
+				for k := range sessionList {
+					s := sessionList[k]
+					if s.session.NumStreams() == 0 || s.session.IsClosed() || time.Since(s.ttl) > maxScavengeTTL {
+						log.Println("session scavenged")
+						s.session.Close()
+					} else {
+						newList = append(newList, sessionList[k])
+					}
+				}
+				sessionList = newList
+			case _, ok := <-quit:
+				if !ok {
+					fmt.Println("quit")
+					return
+				}
+			}
+		}
+	}()
+
+	go func() {
+		wg.Add(1)
+		defer wg.Done()
+		if config.SnmpLog == "" || config.SnmpPeriod == 0 {
+			return
+		}
+		ticker := time.NewTicker(time.Duration(config.SnmpPeriod) * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				f, err := os.OpenFile(time.Now().Format(config.SnmpLog), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+				w := csv.NewWriter(f)
+				// write header in empty file
+				if stat, err := f.Stat(); err == nil && stat.Size() == 0 {
+					if err := w.Write(append([]string{"Unix"}, kcp.DefaultSnmp.Header()...)); err != nil {
+						log.Println(err)
+					}
+				}
+				if err := w.Write(append([]string{fmt.Sprint(time.Now().Unix())}, kcp.DefaultSnmp.ToSlice()...)); err != nil {
+					log.Println(err)
+				}
+				kcp.DefaultSnmp.Reset()
+				w.Flush()
+				f.Close()
+			case _, ok := <-quit:
+				if !ok {
+					fmt.Println("quit")
+					return
+				}
+			}
+		}
+	}()
+
 	rr := uint16(0)
+
 	for {
-		p1, err := listener.AcceptTCP()
-		if err != nil {
-			log.Fatalln(err)
-		}
-		if err := p1.SetReadBuffer(config.SockBuf); err != nil {
-			log.Println("TCP SetReadBuffer:", err)
-		}
-		if err := p1.SetWriteBuffer(config.SockBuf); err != nil {
-			log.Println("TCP SetWriteBuffer:", err)
-		}
-		checkError(err)
-		idx := rr % numconn
+		select {
+		case <-stop:
+			return
+		default:
+			p1, err := listener.AcceptTCP()
+			if err != nil {
+				log.Fatalln(err)
+			}
+			if err := p1.SetReadBuffer(config.SockBuf); err != nil {
+				log.Println("TCP SetReadBuffer:", err)
+			}
+			if err := p1.SetWriteBuffer(config.SockBuf); err != nil {
+				log.Println("TCP SetWriteBuffer:", err)
+			}
+			checkError(err)
+			idx := rr % numconn
 
-		// do auto expiration && reconnection
-		if muxes[idx].session.IsClosed() || (config.AutoExpire > 0 && time.Now().After(muxes[idx].ttl)) {
-			chScavenger <- muxes[idx].session
-			muxes[idx].session = waitConn()
-			muxes[idx].ttl = time.Now().Add(time.Duration(config.AutoExpire) * time.Second)
-		}
+			// do auto expiration && reconnection
+			if muxes[idx].session.IsClosed() || (config.AutoExpire > 0 && time.Now().After(muxes[idx].ttl)) {
+				chScavenger <- muxes[idx].session
+				muxes[idx].session = waitConn()
+				muxes[idx].ttl = time.Now().Add(time.Duration(config.AutoExpire) * time.Second)
+			}
 
-		go handleClient(muxes[idx].session, p1)
-		rr++
+			go handleClient(muxes[idx].session, p1)
+			rr++
+		}
 	}
 }
 
@@ -259,10 +485,65 @@ func main() {
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
 	}
 
-	config := Config{}
+	app := argeParse()
+	app.Action = func(c *cli.Context) error {
+		if c.String("cpuprofile") != "" {
+			f, err := os.Create(c.String("cpuprofile"))
+			if err != nil {
+				log.Fatal(err)
+			}
+			pprof.StartCPUProfile(f)
+			defer pprof.StopCPUProfile()
+		}
 
-	parseJSONConfig(&config, ConfigFile)
-	CreateUi(&config)
+		config := Config{}
+		config.LocalAddr = c.String("localaddr")
+		config.RemoteAddr = c.String("remoteaddr")
+		config.Key = c.String("key")
+		config.Crypt = c.String("crypt")
+		config.Mode = c.String("mode")
+		config.Conn = c.Int("conn")
+		config.AutoExpire = c.Int("autoexpire")
+		config.MTU = c.Int("mtu")
+		config.SndWnd = c.Int("sndwnd")
+		config.RcvWnd = c.Int("rcvwnd")
+		config.DataShard = c.Int("datashard")
+		config.ParityShard = c.Int("parityshard")
+		config.DSCP = c.Int("dscp")
+		config.NoComp = c.Bool("nocomp")
+		config.AckNodelay = c.Bool("acknodelay")
+		config.NoDelay = c.Int("nodelay")
+		config.Interval = c.Int("interval")
+		config.Resend = c.Int("resend")
+		config.NoCongestion = c.Int("nc")
+		config.SockBuf = c.Int("sockbuf")
+		config.KeepAlive = c.Int("keepalive")
+		config.Log = c.String("log")
+		config.SnmpLog = c.String("snmplog")
+		config.SnmpPeriod = c.Int("snmpperiod")
+
+		if c.String("c") != "" {
+			err := parseJSONConfig(&config, c.String("c"))
+			if !os.IsNotExist(err) {
+				checkError(err)
+			}
+		}
+		CreateUi(&config)
+		defer func() {
+
+			if c.String("memprofile") != "" {
+				f, err := os.Create(c.String("memprofile"))
+				if err != nil {
+					log.Fatal(err)
+				}
+				pprof.WriteHeapProfile(f)
+				f.Close()
+			}
+		}()
+		return nil
+	}
+	app.Run(os.Args)
+
 }
 
 type scavengeSession struct {
@@ -280,7 +561,10 @@ func scavenger(ch chan *smux.Session) {
 	var sessionList []scavengeSession
 	for {
 		select {
-		case sess := <-ch:
+		case sess, ok := <-ch:
+			if !ok {
+				return
+			}
 			sessionList = append(sessionList, scavengeSession{sess, time.Now()})
 		case <-ticker.C:
 			var newList []scavengeSession

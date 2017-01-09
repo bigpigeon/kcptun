@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/andlabs/ui"
 )
@@ -18,7 +19,25 @@ func fillSelectField() {
 
 }
 
-func fillConfigPage(c *Config, tab *ui.Tab) {
+func makerule(s string) map[string]string {
+	rulemap := map[string]string{}
+	for _, v := range strings.Split(s, ";") {
+		if v != "" {
+			var key, value string
+			for i, korv := range strings.SplitN(v, ":", 2) {
+				if i == 0 {
+					key = korv
+				} else {
+					value = korv
+				}
+			}
+			rulemap[key] = value
+		}
+	}
+	return rulemap
+}
+
+func fillConfigPage(c *Config, tab *ui.Tab, reloadCallback func(*ui.Button)) {
 	value := reflect.ValueOf(c).Elem()
 
 	boxgroup := [2]*ui.Box{ui.NewVerticalBox(), ui.NewVerticalBox()}
@@ -32,21 +51,8 @@ func fillConfigPage(c *Config, tab *ui.Tab) {
 
 		dvalue := value.Field(i).Interface()
 		box.Append(ui.NewLabel(label), false)
-		tag := field.Tag.Get("ui")
-		rulemap := map[string]string{}
-		for _, v := range strings.Split(tag, ";") {
-			if v != "" {
-				var key, value string
-				for i, korv := range strings.SplitN(v, ":", 2) {
-					if i == 0 {
-						key = korv
-					} else {
-						value = korv
-					}
-				}
-				rulemap[key] = value
-			}
-		}
+
+		rulemap := makerule(field.Tag.Get("ui"))
 		switch field.Type.Kind() {
 		case reflect.String:
 			if rulemap["select"] != "" {
@@ -138,6 +144,7 @@ func fillConfigPage(c *Config, tab *ui.Tab) {
 		if err != nil {
 			panic(err)
 		}
+		reloadCallback(b)
 	})
 
 	pparent := ui.NewVerticalBox()
@@ -150,16 +157,23 @@ func CreateUi(c *Config) {
 	err := ui.Main(func() {
 		logPage := ui.NewVerticalBox()
 		tab := ui.NewTab()
-		fillConfigPage(c, tab)
+		var wg sync.WaitGroup
+		stop := make(chan bool)
+		fillConfigPage(c, tab, func(b *ui.Button) {
+			stop <- true
+			wg.Wait()
+			go background(c, stop, &wg)
+		})
 		tab.Append("log", logPage)
 
-		window := ui.NewWindow("kcpun", 200, 300, false)
+		window := ui.NewWindow("kcptun", 200, 300, false)
 		window.SetChild(tab)
 		window.Show()
 		window.OnClosing(func(*ui.Window) bool {
 			ui.Quit()
 			return true
 		})
+		go background(c, stop, &wg)
 	})
 	if err != nil {
 		panic(err)
