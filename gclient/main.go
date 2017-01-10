@@ -86,7 +86,6 @@ func handleClient(sess *smux.Session, p1 io.ReadWriteCloser) {
 func checkError(err error) {
 	if err != nil {
 		panic(err)
-		os.Exit(-1)
 	}
 }
 
@@ -236,6 +235,12 @@ func argeParse() *cli.App {
 }
 
 func background(config *Config, stop chan bool, wg *sync.WaitGroup) {
+	defer func() {
+		for err := recover(); err != nil; {
+			log.Printf("%+v\n", err)
+			return
+		}
+	}()
 	wg.Add(1)
 	defer wg.Done()
 	// log redirect
@@ -400,7 +405,6 @@ func background(config *Config, stop chan bool, wg *sync.WaitGroup) {
 				sessionList = newList
 			case _, ok := <-quit:
 				if !ok {
-					fmt.Println("quit")
 					return
 				}
 			}
@@ -420,7 +424,6 @@ func background(config *Config, stop chan bool, wg *sync.WaitGroup) {
 			case <-ticker.C:
 				f, err := os.OpenFile(time.Now().Format(config.SnmpLog), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 				if err != nil {
-					log.Println(err)
 					return
 				}
 				w := csv.NewWriter(f)
@@ -438,7 +441,6 @@ func background(config *Config, stop chan bool, wg *sync.WaitGroup) {
 				f.Close()
 			case _, ok := <-quit:
 				if !ok {
-					fmt.Println("quit")
 					return
 				}
 			}
@@ -528,7 +530,7 @@ func main() {
 				checkError(err)
 			}
 		}
-		CreateUi(&config)
+		Gmain(&config)
 		defer func() {
 
 			if c.String("memprofile") != "" {

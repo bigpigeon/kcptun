@@ -144,7 +144,7 @@ func fillConfigPage(c *Config, tab *ui.Tab, reloadCallback func(*ui.Button)) {
 		if err != nil {
 			panic(err)
 		}
-		reloadCallback(b)
+		go reloadCallback(b)
 	})
 
 	pparent := ui.NewVerticalBox()
@@ -153,7 +153,7 @@ func fillConfigPage(c *Config, tab *ui.Tab, reloadCallback func(*ui.Button)) {
 	tab.Append("config", pparent)
 }
 
-func CreateUi(c *Config) {
+func Gmain(c *Config) {
 	err := ui.Main(func() {
 		logPage := ui.NewVerticalBox()
 		tab := ui.NewTab()
@@ -162,6 +162,7 @@ func CreateUi(c *Config) {
 		fillConfigPage(c, tab, func(b *ui.Button) {
 			stop <- true
 			wg.Wait()
+
 			go background(c, stop, &wg)
 		})
 		tab.Append("log", logPage)
